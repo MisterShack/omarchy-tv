@@ -1,0 +1,77 @@
+// TV — optional Omarchy menu integration (Super+Space).
+//
+// The plugin works without this; it only adds a "TV" entry to the Omarchy
+// menu. Merge these keys into your ~/.config/omarchy/extensions/omarchy-menu.jsonc
+// (create that file if it does not exist — it is a flat map of "id" -> entry,
+// where "a.b.c" nests entry c under submenu a.b). The file hot-reloads on save.
+//
+// The "Live now" / "Search channels…" entries call IPC methods that only
+// register when the shell starts, so run `omarchy restart shell` once after
+// enabling the plugin.
+{
+  "tv": {
+    "icon": "󰠫",
+    "label": "TV",
+    "aliases": ["livestream", "livestreams", "stream", "streams", "twitch", "youtube", "watch", "live"]
+  },
+
+  "tv.live": {
+    "icon": "󰐌",
+    "label": "Live now",
+    "description": "Channels you follow that are streaming right now",
+    "action": "omarchy-shell davidshack.tv live"
+  },
+  "tv.search": {
+    "icon": "󰍉",
+    "label": "Search channels…",
+    "description": "Search Twitch and YouTube",
+    "action": "omarchy-shell davidshack.tv search"
+  },
+
+  "tv.accounts": {
+    "icon": "󰀄",
+    "label": "Accounts",
+    "aliases": ["connect", "login", "twitch login", "youtube login"]
+  },
+  "tv.accounts.connect-twitch": {
+    "icon": "",
+    "label": "Connect Twitch",
+    "when": "! \"$HOME/.config/omarchy/plugins/davidshack.tv/tv\" is-connected twitch",
+    "action": "omarchy-launch-floating-terminal-with-presentation \"$HOME/.config/omarchy/plugins/davidshack.tv/tv connect twitch\""
+  },
+  "tv.accounts.connect-youtube": {
+    "icon": "",
+    "label": "Connect YouTube",
+    "when": "! \"$HOME/.config/omarchy/plugins/davidshack.tv/tv\" is-connected youtube",
+    "action": "omarchy-launch-floating-terminal-with-presentation \"$HOME/.config/omarchy/plugins/davidshack.tv/tv connect youtube\""
+  },
+  "tv.accounts.reconnect-twitch": {
+    "icon": "",
+    "label": "Reconnect Twitch",
+    "when": "\"$HOME/.config/omarchy/plugins/davidshack.tv/tv\" is-connected twitch",
+    "action": "omarchy-launch-floating-terminal-with-presentation \"$HOME/.config/omarchy/plugins/davidshack.tv/tv connect twitch --force\""
+  },
+  "tv.accounts.reconnect-youtube": {
+    "icon": "",
+    "label": "Reconnect YouTube",
+    "when": "\"$HOME/.config/omarchy/plugins/davidshack.tv/tv\" is-connected youtube",
+    "action": "omarchy-launch-floating-terminal-with-presentation \"$HOME/.config/omarchy/plugins/davidshack.tv/tv connect youtube --force\""
+  },
+  "tv.accounts.disconnect-twitch": {
+    "icon": "󰗽",
+    "label": "Disconnect Twitch",
+    "when": "\"$HOME/.config/omarchy/plugins/davidshack.tv/tv\" is-connected twitch",
+    "action": "\"$HOME/.config/omarchy/plugins/davidshack.tv/tv\" auth logout twitch && omarchy-notification-send 'TV' 'Disconnected Twitch'"
+  },
+  "tv.accounts.disconnect-youtube": {
+    "icon": "󰗽",
+    "label": "Disconnect YouTube",
+    "when": "\"$HOME/.config/omarchy/plugins/davidshack.tv/tv\" is-connected youtube",
+    "action": "\"$HOME/.config/omarchy/plugins/davidshack.tv/tv\" auth logout youtube && omarchy-notification-send 'TV' 'Disconnected YouTube'"
+  },
+  "tv.accounts.setup-guide": {
+    "icon": "󰋖",
+    "label": "Setup guide",
+    "action": "omarchy-launch-floating-terminal-with-presentation \"$HOME/.config/omarchy/plugins/davidshack.tv/tv setup; echo; read -n1 -r -p 'Press any key…'\""
+  }
+}
