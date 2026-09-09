@@ -19,6 +19,8 @@ Commands:
   tv search <query> [--json] [--platform ...] [--live-only]
   tv fav <list|add|remove|toggle> [platform] [id] [--json]
   tv watch <url|twitch-login>      Open in mpv (falls back to browser)
+  tv chat <url|twitch-login>       Toggle a chat window docked next to mpv
+                                   [--toggle] [--close] [--width N]
   tv open <url>                    Open in the default browser
 
 All state lives under ~/.local/state/omarchy/tv/, credentials under
@@ -43,6 +45,8 @@ from concurrent.futures import ThreadPoolExecutor
 # Paths
 # --------------------------------------------------------------------------- #
 
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
 HOME = os.path.expanduser("~")
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
 STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
@@ -56,6 +60,13 @@ YOUTUBE_TOKEN = os.path.join(STATE_DIR, "youtube.json")
 FAV_FILE = os.path.join(STATE_DIR, "favorites.json")
 SUBS_CACHE = os.path.join(STATE_DIR, "youtube-subs.json")
 LIVE_CACHE = os.path.join(STATE_DIR, "live-cache.json")
+CHAT_STATE = os.path.join(STATE_DIR, "chat.json")
+
+# The sidecar chat window: a chromeless browser window docked next to the mpv
+# player. Matched by this WM class / app-id in Hyprland rules.
+CHAT_CLASS = "tv-chat"
+CHAT_WIDTH = 460           # logical px; overridable with `tv chat --width N`
+CHAT_MPV_SCRIPT = os.path.join(PLUGIN_DIR, "mpv", "tv-chat.lua")
 
 TWITCH_SCOPES = "user:read:follows"
 YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
@@ -905,13 +916,14 @@ def _resolve_url(target: str) -> str:
     return target
 
 
-def _spawn(cmd: list[str]) -> None:
-    subprocess.Popen(
+def _spawn(cmd: list[str], env: dict | None = None) -> subprocess.Popen:
+    return subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
+        env=env,
     )
 
 
@@ -919,17 +931,300 @@ def cmd_watch(args) -> int:
     url = _resolve_url(args.target)
     mpv = _which("mpv")
     if mpv and _which("yt-dlp"):
-        _spawn([
+        mpv_cmd = [
             mpv,
             "--force-window=immediate",
             "--ytdl-format=bestvideo[height<=?1080]+bestaudio/best",
             f"--force-media-title={url}",
-            url,
-        ])
+        ]
+        # Load the bundled chat toggle (key `c`) only for players we launch.
+        if os.path.isfile(CHAT_MPV_SCRIPT):
+            mpv_cmd.append(f"--script={CHAT_MPV_SCRIPT}")
+        mpv_cmd.append(url)
+        env = dict(os.environ)
+        env["TV_HELPER"] = os.path.join(PLUGIN_DIR, "tv")
+        _spawn(mpv_cmd, env=env)
         out({"ok": True, "player": "mpv", "url": url}, args.json)
         return 0
     _spawn(["xdg-open", url])
     out({"ok": True, "player": "browser", "url": url}, args.json)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Chat — a chromeless browser window docked next to the mpv player
+# --------------------------------------------------------------------------- #
+
+_CHROMIUM_BINS = (
+    "chromium", "chromium-browser", "brave", "brave-browser", "google-chrome",
+    "google-chrome-stable", "vivaldi-stable", "microsoft-edge",
+    "microsoft-edge-stable", "helium",
+)
+_FIREFOX_BINS = ("firefox", "librewolf", "zen", "zen-browser")
+
+
+def _chat_url(stream_url: str) -> tuple[str, str] | None:
+    """(platform, popout-chat URL) for a stream URL, or None when unknown."""
+    parsed = urllib.parse.urlparse(
+        stream_url if "://" in stream_url else "https://" + stream_url
+    )
+    host = parsed.netloc.lower().split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    seg = [s for s in parsed.path.split("/") if s]
+    qs = urllib.parse.parse_qs(parsed.query)
+
+    if host in ("twitch.tv", "m.twitch.tv"):
+        skip = {"videos", "directory", "settings", "u", "moderator", "team"}
+        if seg and seg[0].lower() == "popout" and len(seg) > 1:
+            seg = seg[1:]                       # already a /popout/<ch>/chat URL
+        ch = seg[0].lower() if seg and seg[0].lower() not in skip else ""
+        return ("twitch", f"https://www.twitch.tv/popout/{ch}/chat?popout=") if ch else None
+
+    if host in ("youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
+        vid = ""
+        if host == "youtu.be":
+            vid = seg[0] if seg else ""
+        elif seg and seg[0] == "watch":
+            vid = (qs.get("v") or [""])[0]
+        elif seg and seg[0] in ("live", "embed", "shorts", "v"):
+            vid = seg[1] if len(seg) > 1 else ""
+        return ("youtube", f"https://www.youtube.com/live_chat?v={vid}&is_popout=1") if vid else None
+
+    if host in ("kick.com", "m.kick.com"):
+        ch = seg[0] if seg else ""
+        return ("kick", f"https://kick.com/popout/{ch}/chat") if ch else None
+
+    if host == "rumble.com":
+        # No popout-chat URL is derivable from the watch URL; the video page
+        # carries chat inline, so open that.
+        return ("rumble", stream_url)
+
+    return None
+
+
+def _chat_browser_cmd(url: str) -> list[str]:
+    for name in _CHROMIUM_BINS:
+        path = _which(name)
+        if path:
+            return [path, f"--app={url}", f"--class={CHAT_CLASS}"]
+    for name in _FIREFOX_BINS:
+        path = _which(name)
+        if path:
+            return [path, "--class", CHAT_CLASS, "--new-window", url]
+    return ["xdg-open", url]  # no WM class -> Hyprland can't match it; still opens
+
+
+def _hyprctl(*args: str):
+    if not _which("hyprctl"):
+        raise TvError("hyprctl not found — the chat dock needs Hyprland")
+    try:
+        res = subprocess.run(
+            ["hyprctl", "-j", *args], capture_output=True, text=True, timeout=5
+        )
+        return json.loads(res.stdout or "null")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _win(addr: str) -> str:
+    """The `window = "address:0x…"` selector fragment for a Lua dispatcher."""
+    return f'window = "address:{addr}"'
+
+
+def _dispatch(calls: list[str]) -> None:
+    """Run Hyprland Lua dispatchers (Omarchy's `hl.dsp.*` API), best effort.
+
+    Omarchy's Hyprland replaced the legacy string dispatch syntax with a Lua
+    one, so a call looks like:
+        hl.dsp.window.move({ x = 100, y = 40, window = "address:0x1a2b" })
+    """
+    calls = [c for c in calls if c]
+    if not calls or not _which("hyprctl"):
+        return
+    joined = " ; ".join(f"dispatch {c}" for c in calls)
+    try:
+        subprocess.run(["hyprctl", "--batch", joined],
+                       capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _looks_like_chat(client: dict) -> bool:
+    """A chromeless browser window we (probably) opened for chat.
+
+    Chromium ignores --class for --app windows on Wayland and names them
+    `chrome-<url-slug>-<profile>`, so we also match that shape when the slug
+    carries a chat path (`popout…chat`, `live_chat`, `chatroom`).
+    """
+    cls = (client.get("class") or "").lower()
+    ini = (client.get("initialClass") or "").lower()
+    if CHAT_CLASS in (cls, ini):
+        return True
+    slug = cls or ini
+    return slug.startswith(("chrome-", "chromium-")) and (
+        "chat" in slug or "live_chat" in slug or "chatroom" in slug
+    )
+
+
+def _chat_window() -> dict | None:
+    clients = _hyprctl("clients") or []
+    addr = (load_json(CHAT_STATE, {}) or {}).get("chat_addr")
+    if addr:
+        for c in clients:
+            if c.get("address") == addr:
+                return c
+    for c in clients:
+        if _looks_like_chat(c):
+            return c
+    return None
+
+
+def _wait_new_window(before: set, timeout: float = 8.0) -> dict | None:
+    """First window to appear after `before` that looks like our chat window."""
+    deadline = time.monotonic() + timeout
+    fallback = None
+    while time.monotonic() < deadline:
+        for c in _hyprctl("clients") or []:
+            if c.get("address") in before or not c.get("address"):
+                continue
+            if _looks_like_chat(c):
+                return c
+            cls = (c.get("class") or "").lower()
+            if cls.startswith(("chrome-", "chromium", "firefox")) or cls == CHAT_CLASS:
+                fallback = c            # a new browser window, class not yet settled
+        if fallback:
+            time.sleep(0.4)             # give the class a beat to finalise
+            for c in _hyprctl("clients") or []:
+                if c.get("address") == fallback["address"]:
+                    return c
+            return fallback
+        time.sleep(0.15)
+    return None
+
+
+def _mpv_window() -> dict:
+    active = _hyprctl("activewindow") or {}
+    if (active.get("class") or "").lower() == "mpv":
+        return active
+    for c in _hyprctl("clients") or []:
+        if (c.get("class") or "").lower() == "mpv" and c.get("mapped", True):
+            return c
+    return {}
+
+
+def _monitor_bounds(win: dict) -> tuple[float, float, float, float]:
+    """Usable (x, y, w, h) of the monitor a window is on, minus reserved areas."""
+    want = win.get("monitor")
+    for m in _hyprctl("monitors") or []:
+        if want in (m.get("id"), m.get("name")):
+            scale = m.get("scale") or 1.0
+            res = m.get("reserved", [0, 0, 0, 0]) or [0, 0, 0, 0]
+            return (
+                m.get("x", 0) + res[0],
+                m.get("y", 0) + res[1],
+                m.get("width", 1920) / scale - res[0] - res[2],
+                m.get("height", 1080) / scale - res[1] - res[3],
+            )
+    return (0.0, 0.0, 1920.0, 1080.0)
+
+
+def _dock_chat(mpv_win: dict, chat_win: dict, width: int) -> dict:
+    """Put the chat window flush against mpv's right edge. Returns restore info."""
+    mx, my = mpv_win.get("at", [0, 0])
+    mw, mh = mpv_win.get("size", [875, 600])
+    mpv_addr = mpv_win.get("address", "")
+    chat_addr = chat_win.get("address", "")
+    mon_x, _mon_y, mon_w, _mon_h = _monitor_bounds(mpv_win)
+
+    restore: dict = {}
+    chat_x = mx + mw
+    overflow = (chat_x + width) - (mon_x + mon_w)
+    calls: list[str] = []
+    if overflow > 0:
+        new_mx = int(max(mon_x, mx - overflow))
+        restore = {"mpv_addr": mpv_addr, "at": [int(mx), int(my)], "size": [int(mw), int(mh)]}
+        calls.append(
+            f"hl.dsp.window.move({{ x = {new_mx}, y = {int(my)}, {_win(mpv_addr)} }})"
+        )
+        chat_x = new_mx + mw
+
+    # Float first (Omarchy tiles browser windows), then size, then position.
+    calls += [
+        f'hl.dsp.window.float({{ action = "on", {_win(chat_addr)} }})',
+        f"hl.dsp.window.resize({{ x = {int(width)}, y = {int(mh)}, {_win(chat_addr)} }})",
+        f"hl.dsp.window.move({{ x = {int(chat_x)}, y = {int(my)}, {_win(chat_addr)} }})",
+    ]
+    _dispatch(calls)
+    return restore
+
+
+def _close_chat() -> bool:
+    state = load_json(CHAT_STATE, {}) or {}
+    win = _chat_window()
+    addr = state.get("chat_addr") or (win or {}).get("address")
+    closed = False
+    if addr:
+        _dispatch([f"hl.dsp.window.close({{ {_win(addr)} }})"])
+        closed = True
+
+    restore = state.get("restore") or {}
+    if restore.get("mpv_addr") and restore.get("at") and restore.get("size"):
+        rx, ry = restore["at"]
+        rw, rh = restore["size"]
+        _dispatch([
+            f"hl.dsp.window.resize({{ x = {int(rw)}, y = {int(rh)}, {_win(restore['mpv_addr'])} }})",
+            f"hl.dsp.window.move({{ x = {int(rx)}, y = {int(ry)}, {_win(restore['mpv_addr'])} }})",
+        ])
+
+    try:
+        os.remove(CHAT_STATE)
+    except OSError:
+        pass
+    return closed
+
+
+def _open_chat(stream_url: str, width: int) -> dict:
+    resolved = _chat_url(_resolve_url(stream_url))
+    if not resolved:
+        raise TvError(f"don't know how to open chat for: {stream_url}")
+    platform, chaturl = resolved
+
+    if _chat_window():                      # one chat window at a time
+        _close_chat()
+        time.sleep(0.2)
+
+    mpv_win = _mpv_window()
+    before = {c.get("address") for c in (_hyprctl("clients") or [])}
+    _spawn(_chat_browser_cmd(chaturl))
+
+    state = {"platform": platform, "chat_url": chaturl, "stream_url": stream_url}
+    chat_win = _wait_new_window(before)
+    if chat_win:
+        state["chat_addr"] = chat_win["address"]
+        state["chat_class"] = chat_win.get("class", "")
+        if mpv_win.get("address"):
+            state["restore"] = _dock_chat(mpv_win, chat_win, width)
+    save_json(CHAT_STATE, state)
+    return {"ok": True, "chat": "opened", "platform": platform, "url": chaturl,
+            "docked": bool(chat_win and mpv_win.get("address"))}
+
+
+def cmd_chat(args) -> int:
+    width = args.width or CHAT_WIDTH
+
+    if args.close:
+        out({"ok": True, "chat": "closed" if _close_chat() else "not-open"}, args.json)
+        return 0
+
+    if args.toggle and _chat_window():
+        _close_chat()
+        out({"ok": True, "chat": "closed"}, args.json)
+        return 0
+
+    if not args.target:
+        raise TvError("usage: tv chat <url|twitch-login> [--toggle] [--close]")
+    out(_open_chat(args.target, width), args.json)
     return 0
 
 
@@ -1021,6 +1316,15 @@ def build_parser() -> argparse.ArgumentParser:
     watch = sub.add_parser("watch")
     watch.add_argument("target")
     watch.set_defaults(func=cmd_watch)
+
+    chat = sub.add_parser("chat", help="toggle a chat window docked next to mpv")
+    chat.add_argument("target", nargs="?", help="stream URL or twitch login")
+    chat.add_argument("--toggle", action="store_true",
+                      help="open if closed, close if open")
+    chat.add_argument("--close", action="store_true")
+    chat.add_argument("--width", type=int, default=0,
+                      help=f"chat width in px (default {CHAT_WIDTH})")
+    chat.set_defaults(func=cmd_chat)
 
     opn = sub.add_parser("open")
     opn.add_argument("target")

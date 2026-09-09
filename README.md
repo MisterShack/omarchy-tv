@@ -60,6 +60,27 @@ Click the 󰠫 icon (middle-click force-refreshes). In the popup:
 
 Middle-click a row to open it in the browser instead of `mpv`.
 
+## Chat docked to the player
+
+While a stream is playing in mpv, press **`c`** to toggle a chat panel docked to
+the right edge of the player. Press `c` again to close it — the player slides
+back to where it was.
+
+- The chat source is picked from the stream automatically: Twitch and Kick get
+  their popout chat, YouTube its live-chat popout, Rumble its watch page.
+- Chat opens as a chromeless window in your default Chromium-family browser
+  (falls back to Firefox, then a normal browser window), so you stay logged in
+  and can type.
+- Positioning uses `hyprctl`; on a non-Hyprland session the window still opens,
+  just not docked.
+- The `c` binding is added by a bundled mpv script (`mpv/tv-chat.lua`) that mpv
+  loads **only** for players this plugin launches — your global mpv config is
+  untouched. Width: `tv chat --width <px>` (default 460).
+
+For a cleaner toggle (no brief flash of the chat window tiling into the layout
+before it docks), add the optional rule from `examples/hypr-tv-chat.lua` to your
+Hyprland config.
+
 ## Optional: Omarchy menu integration
 
 `examples/omarchy-menu-tv.jsonc` adds a **TV** entry to the Omarchy menu
@@ -93,6 +114,7 @@ hot-reloads on save), then run `omarchy restart shell` once so the `live` /
 | `~/.local/state/omarchy/tv/youtube.json`      | YouTube OAuth tokens          |
 | `~/.local/state/omarchy/tv/favorites.json`    | favorited channels            |
 | `~/.local/state/omarchy/tv/youtube-subs.json` | cached subscription list      |
+| `~/.local/state/omarchy/tv/chat.json`         | open chat window (for toggle)  |
 
 `tv auth logout <twitch|youtube|all>` clears tokens.
 
@@ -107,6 +129,7 @@ tv --json live [--platform twitch|youtube] [--no-cache]
 tv --json search <query> [--live-only]
 tv fav <list|add|remove|toggle> [twitch|youtube] [id]
 tv watch <url|twitch-login>
+tv chat <url|twitch-login> [--toggle] [--close] [--width N]
 tv open <url>
 ```
 
